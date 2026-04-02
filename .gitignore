@@ -1,0 +1,12 @@
+# Secrets and local env
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime / tooling
+node_modules/
+.n8n/
+*.log
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,443 @@
+{
+  "name": "Gmail INN Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "subject:\"SUBJECT_FILTER_QUERY\" in:inbox -from:me"
+        },
+        "options": {}
+      },
+      "id": "1",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        208,
+        304
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "messageId": "={{$json.id}}",
+        "simple": false,
+        "options": {}
+      },
+      "id": "2",
+      "name": "Gmail Get Message",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        432,
+        304
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node (Run Once for All Items)\n// Input: like your example (id/threadId/headers object/text/html/from/to/subject/date)\n// Output: array of items [{ json: {...} }]\n\nfunction stripPrefix(s = '', prefix = '') {\n  s = String(s || '').trim();\n  if (!prefix) return s;\n  const re = new RegExp(`^${prefix}\\\\s*:\\\\s*`, 'i');\n  return s.replace(re, '').trim();\n}\n\nfunction cleanHtml(s = '') {\n  return String(s || '')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/p>|<\\/div>/gi, '\\n')\n    .replace(/<[^>]+>/g, '')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/\\r/g, '')\n    .trim();\n}\n\nfunction extractEmail(s = '') {\n  s = String(s || '');\n  const m = s.match(/<([^>]+)>/);\n  if (m) return m[1].trim();\n  const m2 = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  return m2 ? m2[0].trim() : s.trim();\n}\n\nfunction pickField(text, labels) {\n  // supports both \"ИНН: 123\" and \"ИНН 123\"\n  for (const label of labels) {\n    let re = new RegExp(`(?:^|\\\\n)\\\\s*${label}\\\\s*:\\\\s*(.+)`, 'i');\n    let m = text.match(re);\n    if (m?.[1]) return m[1].trim();\n\n    re = new RegExp(`(?:^|\\\\n)\\\\s*${label}\\\\s+(.+)`, 'i');\n    m = text.match(re);\n    if (m?.[1]) return m[1].trim();\n  }\n  return '';\n}\n\nconst items = $input.all();\n\nreturn items.map((item) => {\n  const msg = item.json || {};\n  const headers = msg.headers || {};\n\n  // 1) sender email\n  const sender_email =\n    msg.from?.value?.[0]?.address\n      ? String(msg.from.value[0].address).trim()\n      : extractEmail(stripPrefix(headers.from || msg.from?.text || '', 'From'));\n\n  // 2) subject/date\n  const subject =\n    (msg.subject && String(msg.subject).trim()) ||\n    stripPrefix(headers.subject || '', 'Subject') ||\n    '';\n\n const messageDateRaw =\n  (msg.date && String(msg.date).trim()) ||\n  stripPrefix(headers.date || '', 'Date') ||\n  '';\n\nlet message_date = '';\nif (messageDateRaw) {\n  const dt = DateTime.fromJSDate(new Date(messageDateRaw), { zone: 'utc' });\n  message_date = dt.setZone('Europe/Moscow').toFormat('yyyy-LL-dd HH:mm:ss');\n}\n\n  // 3) ids\n  const message_id = msg.id || msg.messageId || stripPrefix(headers['message-id'] || '', 'Message-Id') || '';\n  const thread_id = msg.threadId || '';\n\n  // 4) body: prefer msg.text\n  const bodyText =\n    (msg.text && String(msg.text).trim()) ||\n    cleanHtml(msg.html || msg.textAsHtml || '');\n\n  // 5) extract fields\n  let inn = pickField(bodyText, ['ИНН', 'INN', 'Tax ID']);\n  if (!inn) {\n    const m = bodyText.match(/\\b(\\d{10}|\\d{12})\\b/);\n    inn = m ? m[1] : '';\n  }\n  inn = String(inn).replace(/\\D/g, '');\n\n  const org_name = pickField(bodyText, [\n    'Название организации',\n    'Наименование организации',\n    'Наименование',\n    'Организация',\n    'Компания',\n    'Название',\n  ]);\n\n  const org_address = pickField(bodyText, [\n    'Адрес',\n    'Юридический адрес',\n    'Фактический адрес',\n  ]);\n\n  return {\n    json: {\n      sender_email,\n      inn,\n      org_name,\n      org_address,\n      message_date,\n      subject,\n      message_id,\n      thread_id,\n      body_short: bodyText.slice(0, 500),\n      body_full: bodyText,\n    }\n  };\n});"
+      },
+      "id": "3",
+      "name": "Code - Parse Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "SHEET_NAME_MAIN",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "4",
+      "name": "Google Sheets - Read All Rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        912,
+        304
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function normalizeInn(value = '') {\n  return String(value).replace(/\\D+/g, '').trim();\n}\n\nconst parsedItems = $items(\"Code - Parse Email\");\nconst incoming = (parsedItems[0] && parsedItems[0].json) ? parsedItems[0].json : {};\nconst rows = $input.all().map(i => i.json || {});\n\nconst inn = normalizeInn(incoming.inn || '');\nconst innKeys = ['inn', 'ИНН', 'Inn', 'INN'];\n\nfunction getRowInn(row) {\n  for (const k of innKeys) {\n    if (row[k] !== undefined && row[k] !== null) return normalizeInn(row[k]);\n  }\n  return '';\n}\n\nconst exists = !!inn && rows.some(r => getRowInn(r) === inn);\n\nreturn [{\n  json: {\n    ...incoming,\n    inn,\n    inn_exists: exists,\n    rows_count: rows.length\n  }\n}];"
+      },
+      "id": "5",
+      "name": "Code - Check INN Exists",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.inn_exists }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6",
+      "name": "IF - INN Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.sender_email}}",
+        "subject": "={{'Re: ' + $json.subject}}",
+        "message": "Добрый день! Проект с таким ИНН уже принят в работу.",
+        "options": {}
+      },
+      "id": "7",
+      "name": "Gmail Send - Duplicate INN",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        176
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "SHEET_NAME_MAIN",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "created_at": "=={{$now.setZone('Europe/Moscow').toFormat('yyyy-LL-dd HH:mm:ss')}}",
+            "sender_email": "={{$json.sender_email}}",
+            "inn": "={{$json.inn}}",
+            "org_name": "={{$json.org_name}}",
+            "org_address": "={{$json.org_address}}",
+            "message_date": "={{$json.message_date}}",
+            "subject": "={{$json.subject}}",
+            "message_id": "={{$json.message_id}}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sender_email",
+              "displayName": "sender_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inn",
+              "displayName": "inn",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "org_name",
+              "displayName": "org_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "org_address",
+              "displayName": "org_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_date",
+              "displayName": "message_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "8",
+      "name": "Google Sheets - Append Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        1600,
+        432
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.sender_email}}",
+        "subject": "={{'Re: ' + $json.subject}}",
+        "message": "=Добрый день! Проект принят в работу. Прикрепляю коммерческое предложение.",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {}
+            ]
+          }
+        }
+      },
+      "id": "10",
+      "name": "Gmail Send - Success With Attachment",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        432
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GOOGLE_DRIVE_FILE_ID"
+        },
+        "options": {
+          "binaryPropertyName": "data"
+        }
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1808,
+        432
+      ],
+      "id": "94e6c560-ab80-4da4-8509-f37746310eb0",
+      "name": "Download file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "name": "Google Drive account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Gmail Get Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Get Message": {
+      "main": [
+        [
+          {
+            "node": "Code - Parse Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Parse Email": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets - Read All Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets - Read All Rows": {
+      "main": [
+        [
+          {
+            "node": "Code - Check INN Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Check INN Exists": {
+      "main": [
+        [
+          {
+            "node": "IF - INN Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - INN Exists?": {
+      "main": [
+        [
+          {
+            "node": "Gmail Send - Duplicate INN",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Sheets - Append Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets - Append Row": {
+      "main": [
+        [
+          {
+            "node": "Download file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download file": {
+      "main": [
+        [
+          {
+            "node": "Gmail Send - Success With Attachment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "versionId": "00000000-0000-4000-8000-000000000000",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "YOUR_WORKFLOW_ID",
+  "tags": []
+}
