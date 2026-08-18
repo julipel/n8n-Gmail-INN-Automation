@@ -1,42 +1,50 @@
 # n8n Gmail INN Automation
 
-Автоматизация в `n8n` для обработки входящих писем Gmail с заявками и проверкой дублей по ИНН в Google Sheets.
+Автоматизация в `n8n` для обработки входящих заявок в Gmail: парсинг реквизитов организации из письма, проверка дубля по ИНН в Google Sheets и автоответ клиенту (с вложением, если проект новый).
 
 ## Что делает workflow
 
-1. Отслеживает входящие письма Gmail по фильтру темы (`SUBJECT_FILTER_QUERY`)
-2. Получает письмо целиком
-3. Извлекает данные из тела письма:
+1. Отслеживает входящие письма Gmail по фильтру темы (`SUBJECT_FILTER_QUERY`), исключая собственные (`-from:me`).
+2. Получает письмо целиком (`Gmail Get Message`).
+3. Парсит тело письма и извлекает по **каждой** организации, упомянутой в письме:
    - `sender_email`
    - `inn`
    - `org_name`
    - `org_address`
-4. Читает строки из Google Sheets
-5. Проверяет, существует ли ИНН
-6. Если ИНН новый:
-   - добавляет строку в Google Sheets
-   - отправляет ответное письмо с вложением `.docx`
-7. Если ИНН уже есть:
-   - отправляет ответное письмо без вложения
+
+   Письмо может содержать **несколько организаций подряд** (блоки `Название: / ИНН: / Адрес:`) — каждая превращается в отдельный item и обрабатывается независимо.
+4. Для каждого ИНН читает Google Sheets с фильтром `inn = {{$json.inn}}`, чтобы узнать, встречался ли он раньше.
+5. Проверяет наличие ИНН в найденных строках (`Code - Check INN Exists`).
+6. Ветвление по `inn_exists`:
+   - **ИНН уже есть** → отправляется письмо с указанием ИНН (и названия организации, если оно распозналось), без вложения.
+   - **ИНН новый** → строка добавляется в Google Sheets → скачивается файл коммерческого предложения из Google Drive → отправляется письмо с ИНН/названием и вложением.
 
 ---
 
 ## Стек
 
 - `n8n` (self-hosted / cloud)
-- `Gmail Trigger` + `Gmail`
-- `Google Sheets`
-- `Code` nodes (JavaScript, без внешних библиотек)
-- `Google Drive Download` **или** `Read Binary File` (для вложения)
+- `Gmail Trigger` + `Gmail` (получение писем и отправка ответов)
+- `Google Sheets` (реестр проектов, поиск по ИНН)
+- `Google Drive` (шаблон коммерческого предложения для вложения)
+- `Code` nodes (чистый JavaScript, без внешних библиотек)
 
 ---
 
 ## Структура workflow
 
-`Gmail Trigger` → `Gmail Get Message` → `Code - Parse Email` → `Google Sheets - Read All Rows` → `Code - Check INN Exists` → `IF - INN Exists?`
-
-- `TRUE` → `Gmail Send - Duplicate INN`
-- `FALSE` → `Google Sheets - Append Row` → `Google Drive Download / Read Binary File` → `Gmail Send - Success With Attachment`
+```
+Gmail Trigger
+  → Gmail Get Message
+  → Code - Parse Email                 (парсинг ИНН/названия/адреса, поддержка нескольких организаций в письме)
+  → Google Sheets - Read All Rows      (поиск строк с этим ИНН)
+  → Code - Check INN Exists
+  → IF - INN Exists?
+      TRUE  → Gmail Send - Duplicate INN
+      FALSE → Google Sheets - Append Row
+              → Download file (Google Drive)
+              → Gmail Send - Success With Attachment
+```
 
 ---
 
@@ -44,19 +52,20 @@
 
 Создать в n8n:
 
-- `Gmail OAuth2`
-- `Google Sheets OAuth2`
-- (опционально) `Google Drive OAuth2` — если вложение берется из Drive
+- `Gmail OAuth2` — для чтения и отправки писем
+- `Google Sheets OAuth2` — для чтения/записи реестра проектов
+- `Google Drive OAuth2` — для скачивания файла КП, который прикладывается к ответу
 
 ---
 
 ## Placeholders (обязательные для замены)
 
-- `GOOGLE_SHEET_ID`
-- `SHEET_NAME_MAIN` (например: `requests`)
-- `SUBJECT_FILTER_QUERY` (например: `subject:"Новый проект Пардус-р" in:inbox -from:me`)
-- `DOCX_FILE_PATH` (только для варианта с `Read Binary File`)
-- `GOOGLE_DRIVE_FILE_ID` (только для варианта с `Google Drive Download`)
+| Placeholder | Где используется | Что подставить |
+|---|---|---|
+| `SUBJECT_FILTER_QUERY` | `Gmail Trigger` | текст темы письма, по которому фильтруются заявки |
+| `GOOGLE_SHEET_ID` | `Google Sheets - Read All Rows`, `Google Sheets - Append Row` | ID таблицы-реестра |
+| `SHEET_NAME_MAIN` | те же ноды | имя листа (например, `Sheet1`) |
+| `GOOGLE_DRIVE_FILE_ID` | `Download file` | ID файла КП на Google Drive, который прикладывается к успешному ответу |
 
 ---
 
@@ -73,124 +82,98 @@
 - `subject`
 - `message_id`
 
----
-
-## Рекомендованный формат дат
-
-- `created_at`:
-  - `{{$now.setZone('Europe/Moscow').toFormat('yyyy-LL-dd HH:mm:ss')}}`
-- `message_date`:
-  - нормализовать к такому же формату (в Code node или expression в Append Row)
+Столбец `inn` используется как ключ поиска (`Google Sheets - Read All Rows` фильтрует строки по `inn = {{$json.inn}}`).
 
 ---
 
 ## Извлечение данных из письма
 
-Парсер поддерживает:
+Парсер (`Code - Parse Email`) ожидает в теле письма блоки вида:
 
-- ИНН по метке `ИНН:` (приоритет) или regex `10/12` цифр
-- Название по меткам:
-  - `Название организации:`
-  - `Наименование:`
-  - `Организация:`
-  - `Компания:`
-  - `Название:`
-- Адрес по меткам:
-  - `Адрес:`
-  - `Юридический адрес:`
-  - `Фактический адрес:`
+```
+Название: ООО "Ромашка"
+ИНН: 7712345678
+Адрес: г. Москва, ул. Примерная, д. 1
 
-HTML преобразуется в plain text (минимальная очистка).
+Название: ООО "Вторая организация"
+ИНН: 7787654321
+Адрес: г. Санкт-Петербург, ...
+```
+
+- Блоки разделяются по строке, начинающейся с `Название:` — так поддерживаются несколько организаций в одном письме.
+- ИНН ищется по метке `ИНН:` (10 или 12 цифр), либо (если блоков не найдено) первым 10/12-значным числом в тексте письма.
+- Адрес обрезается по маркерам подписи (`С уважением`, `--`, `Regards`, `Best regards`) и по началу следующего блока `Название:`, чтобы в адрес не попадал текст подписи или соседней организации.
+- HTML-тело письма приводится к обычному тексту (замена `<br>`/`</p>`/`</div>` на переносы строк, удаление остальных тегов).
+
+---
+
+## Текст ответных писем
+
+Оба автоответа подставляют ИНН и (если распознано) название организации:
+
+- Дубль: `Добрый день! Проект с ИНН {{$json.inn}} ({{$json.org_name}}) уже принят в работу.`
+- Новый проект: `Добрый день! Проект с ИНН {{$json.inn}} ({{$json.org_name}}) принят в работу. Прикрепляю коммерческое предложение.`
+
+Если `org_name` не распознан, название в скобках просто не добавляется.
 
 ---
 
 ## Важные замечания
 
-### 1) Ветки IF
-Проверь соединения:
+### Множественные организации в одном письме
+`Code - Parse Email` работает в режиме "Run Once for All Items" и может вернуть **несколько items из одного письма** — по одному на каждую организацию. Все последующие ноды (включая `Code - Check INN Exists`, которая сопоставляет `Code - Parse Email` и результаты Google Sheets по каждому item) рассчитаны на это.
 
-- `TRUE (inn_exists = true)` → `Gmail Send - Duplicate INN`
-- `FALSE (inn_exists = false)` → `Append Row` + вложение + success email
+### Тип `inn_exists`
+`Code - Check INN Exists` возвращает строго boolean (`inn_exists: exists`), это важно для корректной работы IF-ноды со strict type validation.
 
-### 2) Тип `inn_exists`
-В `Code - Check INN Exists` возвращай строго boolean:
-
-```js
-inn_exists: Boolean(exists)
-```
-
-### 3) Локальные файлы в self-hosted
-Если используешь `Read Binary File`, в n8n может быть ограничение на allowed path.  
-Для n8n 2.4.8 обычно разрешен путь:
-
-- `/home/node/.n8n-files`
+### `alwaysOutputData` на `Google Sheets - Read All Rows`
+Включено намеренно: если по ИНН ничего не найдено, нода всё равно должна вернуть пустой item, иначе для писем без совпадений в таблице обработка молча остановится.
 
 ---
 
 ## Запуск self-hosted (docker compose)
 
-Пример `docker-compose.yml`:
-
-```yaml
-services:
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n_compose
-    restart: unless-stopped
-    ports:
-      - "5678:5678"
-    environment:
-      - N8N_HOST=localhost
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=http
-      - TZ=Europe/Moscow
-      - N8N_ENCRYPTION_KEY=change_me_32_chars_min
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - C:/n8n/files:/home/node/.n8n-files
-
-volumes:
-  n8n_data:
-```
-
-Запуск:
-
 ```bash
 docker compose -p n8nlocal up -d
 ```
+
+См. `docker-compose.yml` в репозитории — поднимает `n8n` на `localhost:5678` с таймзоной `Europe/Moscow`. Перед запуском замените `N8N_ENCRYPTION_KEY` на собственное значение (минимум 32 символа).
 
 ---
 
 ## Импорт workflow
 
-- В UI: `Workflows` → `Import from file`
-- Выбрать `gmail-inn-workflow.json`
-- Подключить credentials
-- Обновить placeholders
-- `Activate`
+1. В UI n8n: `Workflows` → `Import from file`.
+2. Выбрать `Gmail INN Automation.json`.
+3. Подключить credentials (Gmail OAuth2, Google Sheets OAuth2, Google Drive OAuth2).
+4. Заменить все placeholders (см. таблицу выше).
+5. Проверить соответствие заголовков в Google Sheets ожидаемой схеме.
+6. `Activate`.
 
 ---
 
 ## Тест-план
 
-1. Отправить письмо с новым ИНН:
-   - запись добавляется в Sheets
-   - приходит success-письмо с вложением
-2. Отправить письмо с тем же ИНН:
-   - запись не добавляется
-   - приходит duplicate-письмо без вложения
-3. Проверить, что фильтр темы не цепляет исходящие (`-from:me`, `in:inbox`)
+1. Письмо с новым ИНН:
+   - строка добавляется в Google Sheets;
+   - приходит письмо с указанием ИНН/названия и вложением КП.
+2. Письмо с уже существующим в таблице ИНН:
+   - новая строка не добавляется;
+   - приходит письмо с указанием ИНН/названия, без вложения.
+3. Письмо с несколькими организациями сразу:
+   - каждая организация обрабатывается независимо (своя проверка на дубль, свой ответ/запись).
+4. Письмо, не подходящее под `SUBJECT_FILTER_QUERY` или отправленное с собственного адреса — не должно триггерить workflow (`-from:me`, `in:inbox`).
 
 ---
 
 ## Безопасность
 
-- Не хранить OAuth токены в репозитории
-- Не коммитить `.env` и чувствительные данные
-- Для публичного репо использовать placeholders вместо реальных ID
+- Не хранить OAuth токены, ID таблиц/файлов и реальные фильтры тем писем в репозитории — использовать placeholders.
+- Не коммитить `.env` и любые файлы с реальными credentials.
+- Публикуемая версия `Gmail INN Automation.json` в этом репозитории уже очищена от реальных ID и имён credentials — перед импортом в свой n8n подставьте собственные значения.
 
 ---
 
 ## Лицензия
 
-Укажите нужную лицензию (например MIT) в отдельном файле `LICENSE`.
+Лицензия не определена. При необходимости добавьте файл `LICENSE` (например, MIT).

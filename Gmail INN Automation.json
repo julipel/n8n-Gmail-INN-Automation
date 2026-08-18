@@ -53,7 +53,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// n8n Code node (Run Once for All Items)\n// Input: like your example (id/threadId/headers object/text/html/from/to/subject/date)\n// Output: array of items [{ json: {...} }]\n\nfunction stripPrefix(s = '', prefix = '') {\n  s = String(s || '').trim();\n  if (!prefix) return s;\n  const re = new RegExp(`^${prefix}\\\\s*:\\\\s*`, 'i');\n  return s.replace(re, '').trim();\n}\n\nfunction cleanHtml(s = '') {\n  return String(s || '')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/p>|<\\/div>/gi, '\\n')\n    .replace(/<[^>]+>/g, '')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/\\r/g, '')\n    .trim();\n}\n\nfunction extractEmail(s = '') {\n  s = String(s || '');\n  const m = s.match(/<([^>]+)>/);\n  if (m) return m[1].trim();\n  const m2 = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  return m2 ? m2[0].trim() : s.trim();\n}\n\nfunction pickField(text, labels) {\n  // supports both \"ИНН: 123\" and \"ИНН 123\"\n  for (const label of labels) {\n    let re = new RegExp(`(?:^|\\\\n)\\\\s*${label}\\\\s*:\\\\s*(.+)`, 'i');\n    let m = text.match(re);\n    if (m?.[1]) return m[1].trim();\n\n    re = new RegExp(`(?:^|\\\\n)\\\\s*${label}\\\\s+(.+)`, 'i');\n    m = text.match(re);\n    if (m?.[1]) return m[1].trim();\n  }\n  return '';\n}\n\nconst items = $input.all();\n\nreturn items.map((item) => {\n  const msg = item.json || {};\n  const headers = msg.headers || {};\n\n  // 1) sender email\n  const sender_email =\n    msg.from?.value?.[0]?.address\n      ? String(msg.from.value[0].address).trim()\n      : extractEmail(stripPrefix(headers.from || msg.from?.text || '', 'From'));\n\n  // 2) subject/date\n  const subject =\n    (msg.subject && String(msg.subject).trim()) ||\n    stripPrefix(headers.subject || '', 'Subject') ||\n    '';\n\n const messageDateRaw =\n  (msg.date && String(msg.date).trim()) ||\n  stripPrefix(headers.date || '', 'Date') ||\n  '';\n\nlet message_date = '';\nif (messageDateRaw) {\n  const dt = DateTime.fromJSDate(new Date(messageDateRaw), { zone: 'utc' });\n  message_date = dt.setZone('Europe/Moscow').toFormat('yyyy-LL-dd HH:mm:ss');\n}\n\n  // 3) ids\n  const message_id = msg.id || msg.messageId || stripPrefix(headers['message-id'] || '', 'Message-Id') || '';\n  const thread_id = msg.threadId || '';\n\n  // 4) body: prefer msg.text\n  const bodyText =\n    (msg.text && String(msg.text).trim()) ||\n    cleanHtml(msg.html || msg.textAsHtml || '');\n\n  // 5) extract fields\n  let inn = pickField(bodyText, ['ИНН', 'INN', 'Tax ID']);\n  if (!inn) {\n    const m = bodyText.match(/\\b(\\d{10}|\\d{12})\\b/);\n    inn = m ? m[1] : '';\n  }\n  inn = String(inn).replace(/\\D/g, '');\n\n  const org_name = pickField(bodyText, [\n    'Название организации',\n    'Наименование организации',\n    'Наименование',\n    'Организация',\n    'Компания',\n    'Название',\n  ]);\n\n  const org_address = pickField(bodyText, [\n    'Адрес',\n    'Юридический адрес',\n    'Фактический адрес',\n  ]);\n\n  return {\n    json: {\n      sender_email,\n      inn,\n      org_name,\n      org_address,\n      message_date,\n      subject,\n      message_id,\n      thread_id,\n      body_short: bodyText.slice(0, 500),\n      body_full: bodyText,\n    }\n  };\n});"
+        "jsCode": "// n8n Code node (Run Once for All Items)\n// Parses emails that may contain MULTIPLE organizations:\n// \"Название: ...\\nИНН: ...\\nАдрес: ...\\n\\nНазвание: ...\\nИНН ...\\nАдрес: ...\"\n\nfunction stripPrefix(s = '', prefix = '') {\n  s = String(s || '').trim();\n  if (!prefix) return s;\n  const re = new RegExp(`^${prefix}\\\\s*:\\\\s*`, 'i');\n  return s.replace(re, '').trim();\n}\n\nfunction cleanHtml(s = '') {\n  return String(s || '')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/p>|<\\/div>/gi, '\\n')\n    .replace(/<[^>]+>/g, '')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/\\r/g, '')\n    .trim();\n}\n\nfunction extractEmail(s = '') {\n  s = String(s || '');\n  const m = s.match(/<([^>]+)>/);\n  if (m) return m[1].trim();\n  const m2 = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  return m2 ? m2[0].trim() : s.trim();\n}\n\nfunction normalizeSpaces(s = '') {\n  return String(s)\n    .replace(/\\u00A0/g, ' ') // nbsp\n    .replace(/[ \\t]+/g, ' ')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nfunction toMoscowString(dateValue) {\n  const d = new Date(dateValue);\n  if (Number.isNaN(d.getTime())) return String(dateValue || '').trim();\n  return d.toISOString();\n}\n\nfunction parseOrganizations(text) {\n  const blocks = text\n    .split(/\\n(?=Название\\s*:)/i)\n    .map(b => b.trim())\n    .filter(Boolean);\n\n  const results = [];\n\n  for (const block of blocks) {\n    const nameMatch = block.match(/Название\\s*:\\s*(.+)/i);\n    const org_name = nameMatch ? nameMatch[1].trim() : '';\n\n    const innMatch = block.match(/ИНН\\s*:?\\s*(\\d{10}|\\d{12})/i);\n    const inn = innMatch ? innMatch[1].trim() : '';\n\n    // --- patched address parsing (cuts off signatures / next blocks) ---\n    let org_address = '';\n    const addrMatch = block.match(/Адрес\\s*:\\s*([\\s\\S]+)/i);\n\n    if (addrMatch && addrMatch[1]) {\n      org_address = addrMatch[1];\n\n      // Обрезаем по \"С уважением\" и другим маркерам подписи\n      org_address = org_address.split(/\\n\\s*(С уважением|--|Regards|Best regards)/i)[0];\n\n      // Удаляем возможный следующий блок \"Название:\"\n      org_address = org_address.split(/\\n\\s*Название\\s*:/i)[0];\n\n      // Нормализация\n      org_address = org_address\n        .replace(/\\u00A0/g, ' ')\n        .replace(/\\s+/g, ' ')\n        .trim()\n        .replace(/,$/, '');\n    }\n    // --- end patch ---\n\n    if (inn || org_name || org_address) {\n      results.push({ org_name, inn, org_address });\n    }\n  }\n\n  return results;\n}\n\nconst inputItems = $input.all();\nconst output = [];\n\nfor (const item of inputItems) {\n  const msg = item.json || {};\n  const headers = msg.headers || {};\n\n  const sender_email =\n    msg.from?.value?.[0]?.address\n      ? String(msg.from.value[0].address).trim()\n      : extractEmail(stripPrefix(headers.from || msg.from?.text || '', 'From'));\n\n  const subject =\n    (msg.subject && String(msg.subject).trim()) ||\n    stripPrefix(headers.subject || '', 'Subject') ||\n    '';\n\n  const messageDateRaw =\n    (msg.date && String(msg.date).trim()) ||\n    stripPrefix(headers.date || '', 'Date') ||\n    '';\n\n  const message_date = toMoscowString(messageDateRaw);\n\n  const message_id = msg.id || msg.messageId || stripPrefix(headers['message-id'] || '', 'Message-Id') || '';\n  const thread_id = msg.threadId || '';\n\n  const bodyTextRaw =\n    (msg.text && String(msg.text).trim()) ||\n    cleanHtml(msg.html || msg.textAsHtml || '');\n\n  const bodyText = normalizeSpaces(bodyTextRaw);\n\n  const orgs = parseOrganizations(bodyText);\n\n  const finalOrgs = orgs.length ? orgs : [{\n    org_name: '',\n    inn: (bodyText.match(/\\b(\\d{10}|\\d{12})\\b/) || [,''])[1],\n    org_address: '',\n  }];\n\n  for (const org of finalOrgs) {\n    output.push({\n      json: {\n        sender_email,\n        inn: String(org.inn || '').replace(/\\D/g, ''),\n        org_name: org.org_name || '',\n        org_address: org.org_address || '',\n        message_date,\n        subject,\n        message_id,\n        thread_id,\n        body_short: bodyText.slice(0, 500),\n        body_full: bodyText,\n      }\n    });\n  }\n}\n\nreturn output;"
       },
       "id": "3",
       "name": "Code - Parse Email",
@@ -76,6 +76,14 @@
           "value": "SHEET_NAME_MAIN",
           "mode": "name"
         },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "inn",
+              "lookupValue": "={{ $json.inn }}"
+            }
+          ]
+        },
         "options": {}
       },
       "id": "4",
@@ -95,7 +103,7 @@
     },
     {
       "parameters": {
-        "jsCode": "function normalizeInn(value = '') {\n  return String(value).replace(/\\D+/g, '').trim();\n}\n\nconst parsedItems = $items(\"Code - Parse Email\");\nconst incoming = (parsedItems[0] && parsedItems[0].json) ? parsedItems[0].json : {};\nconst rows = $input.all().map(i => i.json || {});\n\nconst inn = normalizeInn(incoming.inn || '');\nconst innKeys = ['inn', 'ИНН', 'Inn', 'INN'];\n\nfunction getRowInn(row) {\n  for (const k of innKeys) {\n    if (row[k] !== undefined && row[k] !== null) return normalizeInn(row[k]);\n  }\n  return '';\n}\n\nconst exists = !!inn && rows.some(r => getRowInn(r) === inn);\n\nreturn [{\n  json: {\n    ...incoming,\n    inn,\n    inn_exists: exists,\n    rows_count: rows.length\n  }\n}];"
+        "jsCode": "function normalizeInn(value = '') {\n  return String(value).replace(/\\D+/g, '').trim();\n}\n\n// Берём ВСЕ элементы из Parse Email (их может быть несколько, если в письме\n// перечислено несколько организаций)\nconst parsedItems = $items(\"Code - Parse Email\").map(i => i.json);\n\n// Строки из Google Sheets Read (это текущий input данной ноды)\nconst rows = $input.all().map(i => i.json || {});\n\n// Сет ИНН из таблицы (быстрее и чище)\nconst innKeys = ['inn', 'ИНН', 'Inn', 'INN'];\nfunction getRowInn(row) {\n  for (const k of innKeys) {\n    if (row[k] !== undefined && row[k] !== null) return normalizeInn(row[k]);\n  }\n  return '';\n}\n\nconst innSet = new Set(\n  rows.map(getRowInn).filter(Boolean)\n);\n\n// Возвращаем items по каждому parsed item\nreturn parsedItems.map(p => {\n  const inn = normalizeInn(p.inn || '');\n  const exists = !!inn && innSet.has(inn);\n\n  return {\n    json: {\n      ...p,\n      inn,\n      inn_exists: exists,\n      rows_count: rows.length\n    }\n  };\n});"
       },
       "id": "5",
       "name": "Code - Check INN Exists",
@@ -144,7 +152,7 @@
       "parameters": {
         "sendTo": "={{$json.sender_email}}",
         "subject": "={{'Re: ' + $json.subject}}",
-        "message": "Добрый день! Проект с таким ИНН уже принят в работу.",
+        "message": "=Добрый день! Проект с ИНН {{$json.inn}}{{$json.org_name ? ' (' + $json.org_name + ')' : ''}} уже принят в работу.",
         "options": {}
       },
       "id": "7",
@@ -282,33 +290,6 @@
     },
     {
       "parameters": {
-        "sendTo": "={{$json.sender_email}}",
-        "subject": "={{'Re: ' + $json.subject}}",
-        "message": "=Добрый день! Проект принят в работу. Прикрепляю коммерческое предложение.",
-        "options": {
-          "attachmentsUi": {
-            "attachmentsBinary": [
-              {}
-            ]
-          }
-        }
-      },
-      "id": "10",
-      "name": "Gmail Send - Success With Attachment",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2,
-      "position": [
-        1984,
-        432
-      ],
-      "credentials": {
-        "gmailOAuth2": {
-          "name": "Gmail account"
-        }
-      }
-    },
-    {
-      "parameters": {
         "operation": "download",
         "fileId": {
           "__rl": true,
@@ -330,6 +311,33 @@
       "credentials": {
         "googleDriveOAuth2Api": {
           "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.sender_email}}",
+        "subject": "={{'Re: ' + $json.subject}}",
+        "message": "=Добрый день! Проект с ИНН {{$json.inn}}{{$json.org_name ? ' (' + $json.org_name + ')' : ''}} принят в работу. Прикрепляю коммерческое предложение.",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {}
+            ]
+          }
+        }
+      },
+      "id": "10",
+      "name": "Gmail Send - Success With Attachment",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        432
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
         }
       }
     }
@@ -433,7 +441,9 @@
     }
   },
   "active": true,
-  "settings": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
   "versionId": "00000000-0000-4000-8000-000000000000",
   "meta": {
     "templateCredsSetupCompleted": false
