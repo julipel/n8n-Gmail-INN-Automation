@@ -1,0 +1,633 @@
+{
+  "name": "Gmail INN Automation AI",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "subject:\"SUBJECT_FILTER_QUERY\" in:inbox -from:me"
+        },
+        "options": {}
+      },
+      "id": "b0721831-8ed2-4e18-b03e-f09c45ca51d6",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [
+        -4416,
+        -16
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "messageId": "={{$json.id}}",
+        "simple": false,
+        "options": {}
+      },
+      "id": "f74cab1f-fc13-48a3-aeb8-6f68f50a881a",
+      "name": "Gmail Get Message",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -4192,
+        -16
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare Email Data — only extract email metadata + body text for AI.\n// Does NOT extract org_name / inn / org_address.\n\nfunction stripPrefix(s = '', prefix = '') {\n  s = String(s || '').trim();\n  if (!prefix) return s;\n  const re = new RegExp(`^${prefix}\\\\s*:\\\\s*`, 'i');\n  return s.replace(re, '').trim();\n}\n\nfunction cleanHtml(s = '') {\n  return String(s || '')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/p>|<\\/div>|<\\/tr>|<\\/li>/gi, '\\n')\n    .replace(/<\\/td>|<\\/th>/gi, '\\t')\n    .replace(/<[^>]+>/g, '')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#39;/gi, \"'\")\n    .replace(/\\r/g, '')\n    .trim();\n}\n\nfunction extractEmail(s = '') {\n  s = String(s || '');\n  const m = s.match(/<([^>]+)>/);\n  if (m) return m[1].trim();\n  const m2 = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);\n  return m2 ? m2[0].trim() : s.trim();\n}\n\nfunction normalizeSpaces(s = '') {\n  return String(s)\n    .replace(/\\u00A0/g, ' ')\n    .replace(/[ \\t]+/g, ' ')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nfunction toMoscowString(dateValue) {\n  if (!dateValue) return '';\n  try {\n    const dt = DateTime.fromJSDate(new Date(dateValue), { zone: 'utc' });\n    if (!dt.isValid) {\n      const d = new Date(dateValue);\n      if (Number.isNaN(d.getTime())) return String(dateValue).trim();\n      return d.toISOString();\n    }\n    return dt.setZone('Europe/Moscow').toFormat('yyyy-LL-dd HH:mm:ss');\n  } catch (e) {\n    const d = new Date(dateValue);\n    if (Number.isNaN(d.getTime())) return String(dateValue || '').trim();\n    return d.toISOString();\n  }\n}\n\nconst items = $input.all();\n\nreturn items.map((item) => {\n  const msg = item.json || {};\n  const headers = msg.headers || {};\n\n  const sender_email =\n    msg.from?.value?.[0]?.address\n      ? String(msg.from.value[0].address).trim()\n      : extractEmail(stripPrefix(headers.from || msg.from?.text || '', 'From'));\n\n  const subject =\n    (msg.subject && String(msg.subject).trim()) ||\n    stripPrefix(headers.subject || '', 'Subject') ||\n    '';\n\n  const messageDateRaw =\n    (msg.date && String(msg.date).trim()) ||\n    stripPrefix(headers.date || '', 'Date') ||\n    '';\n\n  const message_date = toMoscowString(messageDateRaw);\n\n  const message_id =\n    msg.id ||\n    msg.messageId ||\n    stripPrefix(headers['message-id'] || '', 'Message-Id') ||\n    '';\n  const thread_id = msg.threadId || '';\n\n  const bodyTextRaw =\n    (msg.text && String(msg.text).trim()) ||\n    cleanHtml(msg.html || msg.textAsHtml || '');\n\n  const body_full = normalizeSpaces(bodyTextRaw);\n\n  return {\n    json: {\n      sender_email,\n      subject,\n      message_date,\n      message_id,\n      thread_id,\n      body_full,\n    },\n  };\n});\n"
+      },
+      "id": "c2e45dca-60a7-44ba-a809-10313edcc33b",
+      "name": "Prepare Email Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3952,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "text": "={{ 'Извлеки организации и их данные из следующего входящего письма.\\nТема:\\n' + ($json.subject || '') + '\\nТекст письма:\\n' + ($json.body_full || '') }}",
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"organizations\": {\n      \"type\": \"array\",\n      \"description\": \"List of organizations with valid INN candidates extracted from the email\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"org_name\": {\n            \"type\": \"string\",\n            \"description\": \"Full organization name\"\n          },\n          \"inn\": {\n            \"type\": \"string\",\n            \"description\": \"INN digits only, length 10 or 12\"\n          },\n          \"org_address\": {\n            \"type\": \"string\",\n            \"description\": \"Organization address or empty string\"\n          }\n        },\n        \"required\": [\n          \"org_name\",\n          \"inn\",\n          \"org_address\"\n        ],\n        \"additionalProperties\": false\n      }\n    },\n    \"warnings\": {\n      \"type\": \"array\",\n      \"description\": \"Recognition problems and unresolved cases\",\n      \"items\": {\n        \"type\": \"string\"\n      }\n    }\n  },\n  \"required\": [\n    \"organizations\",\n    \"warnings\"\n  ],\n  \"additionalProperties\": false\n}",
+        "options": {
+          "systemPromptTemplate": "Ты — модуль извлечения структурированных данных из входящих заявок.\nТвоя задача — найти в тексте письма все организации, относящиеся к заявке.\nДля каждой организации извлеки:\n* org_name — полное название организации;\n* inn — ИНН;\n* org_address — адрес организации, если он указан.\n\nПравила:\n1. В одном письме может находиться одна или несколько организаций.\n2. Данные могут быть написаны обычным текстом, списком, таблицей или вставлены из Excel / Google Sheets.\n3. Название организации и ИНН могут находиться:\n   * в одной строке;\n   * в разных строках;\n   * в соседних столбцах таблицы.\n4. ИНН должен содержать только цифры.\n5. Допустимая длина ИНН — 10 или 12 цифр.\n6. Никогда не придумывай отсутствующие данные.\n7. Если адрес отсутствует, верни пустую строку.\n8. Не принимай номера телефонов, даты, номера договоров, КПП, ОГРН и другие числовые значения за ИНН.\n9. Не включай подпись отправителя, телефон, email и служебный текст письма в название или адрес организации.\n10. Извлеки все организации из письма, а не только первую.\n11. Если принадлежность ИНН конкретной организации нельзя определить надёжно, не придумывай связь, а добавь описание проблемы в `warnings`.\n12. Не добавляй организацию без корректного ИНН в основной массив `organizations`.\n13. Верни только данные согласно заданной JSON-схеме."
+        }
+      },
+      "id": "a372d18a-dd9e-4bed-8302-3552a19abd87",
+      "name": "AI Extract Organizations",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        -3712,
+        -16
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate Organizations — normalize/validate only.\n// Returns ONE item with organizations[] (each org already includes email metadata).\n// Actual fan-out to multiple n8n items is done by Split Out node.\n\nfunction normalizeInn(value = '') {\n  return String(value ?? '').replace(/\\D+/g, '').trim();\n}\n\nfunction tryParseJson(value) {\n  if (typeof value !== 'string') return value;\n  const s = value.trim();\n  if (!s) return value;\n  try {\n    return JSON.parse(s);\n  } catch (e) {\n    return value;\n  }\n}\n\nfunction asArray(value) {\n  value = tryParseJson(value);\n  if (Array.isArray(value)) return value;\n  if (value && typeof value === 'object') return [value];\n  return null;\n}\n\nfunction unwrapExtracted(aiJson) {\n  if (!aiJson || typeof aiJson !== 'object') return {};\n  if (aiJson.error) return { error: aiJson.error };\n\n  let root = aiJson;\n  // Information Extractor: { output: { organizations, warnings } }\n  if (root.output !== undefined) root = tryParseJson(root.output);\n  // Rare: double wrap\n  if (root && typeof root === 'object' && root.output !== undefined && root.organizations === undefined) {\n    root = tryParseJson(root.output);\n  }\n  // Rare: output is directly the organizations array\n  if (Array.isArray(root)) {\n    return { organizations: root, warnings: [] };\n  }\n  if (!root || typeof root !== 'object') return {};\n  return root;\n}\n\nconst prepareItems = $items('Prepare Email Data');\nconst aiItems = $input.all();\nconst output = [];\n\nfor (let i = 0; i < aiItems.length; i++) {\n  const aiJson = aiItems[i].json || {};\n  const meta = (prepareItems[i] || prepareItems[0] || { json: {} }).json || {};\n\n  const emailMeta = {\n    sender_email: meta.sender_email || '',\n    subject: meta.subject || '',\n    message_date: meta.message_date || '',\n    message_id: meta.message_id || '',\n    thread_id: meta.thread_id || '',\n    body_full: meta.body_full || '',\n  };\n\n  const extracted = unwrapExtracted(aiJson);\n\n  if (extracted.error) {\n    output.push({\n      json: {\n        ...emailMeta,\n        organizations: [],\n        warnings: [],\n        error_reason: String(extracted.error),\n        needs_manual_review: true,\n      },\n    });\n    continue;\n  }\n\n  const warningsRaw = asArray(extracted.warnings);\n  const warnings = warningsRaw ? warningsRaw.map(String) : [];\n  const organizations = asArray(extracted.organizations);\n\n  if (!organizations) {\n    output.push({\n      json: {\n        ...emailMeta,\n        organizations: [],\n        warnings,\n        error_reason: 'Invalid AI structure: organizations is not an array',\n        needs_manual_review: true,\n      },\n    });\n    continue;\n  }\n\n  const localWarnings = [...warnings];\n  const validOrgs = [];\n  const seenInns = new Set();\n\n  for (const org of organizations) {\n    const row = org && typeof org === 'object' ? org : {};\n    const org_name = String(row.org_name ?? '').trim();\n    const org_address = String(row.org_address ?? '').trim();\n    const inn = normalizeInn(row.inn);\n\n    if (!inn || (inn.length !== 10 && inn.length !== 12)) {\n      localWarnings.push(\n        `Excluded \"${org_name || 'unknown'}\": INN must be 10 or 12 digits (got \"${row.inn ?? ''}\")`\n      );\n      continue;\n    }\n\n    if (!org_name) {\n      localWarnings.push(`Excluded INN ${inn}: empty org_name`);\n      continue;\n    }\n\n    if (seenInns.has(inn)) {\n      localWarnings.push(`Skipped duplicate INN within same email: ${inn} (${org_name})`);\n      continue;\n    }\n    seenInns.add(inn);\n\n    // Metadata duplicated into each org so Split Out (noOtherFields) keeps flat items\n    validOrgs.push({\n      ...emailMeta,\n      org_name,\n      inn,\n      org_address,\n      needs_manual_review: false,\n    });\n  }\n\n  if (validOrgs.length === 0) {\n    output.push({\n      json: {\n        ...emailMeta,\n        organizations: [],\n        warnings: localWarnings,\n        error_reason: localWarnings.length\n          ? localWarnings.join('; ')\n          : 'No valid organizations extracted',\n        needs_manual_review: true,\n      },\n    });\n    continue;\n  }\n\n  output.push({\n    json: {\n      ...emailMeta,\n      organizations: validOrgs,\n      warnings: localWarnings,\n      needs_manual_review: false,\n      org_count: validOrgs.length,\n    },\n  });\n}\n\nreturn output;\n"
+      },
+      "id": "d1694a91-ee2b-4c4a-b21d-ff94052da44f",
+      "name": "Validate Organizations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3472,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "b1c2d3e4-f5a6-7890-bc12-de34f5600001",
+              "leftValue": "={{ $json.needs_manual_review }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2baa2a4e-3eae-4cb1-b3fc-4c142586a8de",
+      "name": "IF - Needs Manual Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -3264,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "organizations",
+        "options": {}
+      },
+      "id": "7ecbc8c2-2e89-40de-a7e2-5f729ee3ada2",
+      "name": "Split Organizations",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        -3024,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Needs Manual Review — package payload for human review.\n// No Sheets write, no auto-reply.\nconst items = $input.all();\n\nreturn items.map((item) => {\n  const j = item.json || {};\n  return {\n    json: {\n      review_status: 'needs_manual_review',\n      sender_email: j.sender_email || '',\n      subject: j.subject || '',\n      message_id: j.message_id || '',\n      thread_id: j.thread_id || '',\n      message_date: j.message_date || '',\n      body_full: j.body_full || '',\n      warnings: Array.isArray(j.warnings) ? j.warnings : [],\n      error_reason: j.error_reason || 'Recognition failed or no valid organizations',\n      organizations: Array.isArray(j.organizations) ? j.organizations : [],\n    },\n  };\n});\n"
+      },
+      "id": "b495f0ea-e20b-40f0-9ac6-7e8d664ad03f",
+      "name": "Needs Manual Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3024,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "SHEET_NAME_MAIN",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "inn",
+              "lookupValue": "={{ $json.inn }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "05726900-a8bc-4265-a58a-b8d8216f448a",
+      "name": "Google Sheets - Read All Rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        -2800,
+        -96
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check each organization INN independently against Google Sheets lookup results.\nfunction normalizeInn(value = '') {\n  return String(value ?? '').replace(/\\D+/g, '').trim();\n}\n\nconst orgItems = $items('Split Organizations')\n  .map((i) => i.json || {})\n  .filter((j) => j && j.inn && !j.needs_manual_review);\n\nconst sheetItems = $input.all();\nconst rows = sheetItems.map((i) => i.json || {});\n\nconst innKeys = ['inn', 'ИНН', 'Inn', 'INN'];\nfunction getRowInn(row) {\n  for (const k of innKeys) {\n    if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') {\n      return normalizeInn(row[k]);\n    }\n  }\n  return '';\n}\n\n// Pair each org with its own Sheets lookup result(s) via pairedItem when possible.\nfunction pairedIndex(item, fallback) {\n  const pi = item.pairedItem;\n  if (typeof pi === 'number') return pi;\n  if (pi && typeof pi === 'object' && typeof pi.item === 'number') return pi.item;\n  if (Array.isArray(pi) && pi[0] && typeof pi[0].item === 'number') return pi[0].item;\n  return fallback;\n}\n\nconst rowsByOrgIndex = new Map();\nsheetItems.forEach((item, idx) => {\n  const orgIdx = pairedIndex(item, idx);\n  if (!rowsByOrgIndex.has(orgIdx)) rowsByOrgIndex.set(orgIdx, []);\n  rowsByOrgIndex.get(orgIdx).push(item.json || {});\n});\n\nreturn orgItems.map((p, idx) => {\n  const inn = normalizeInn(p.inn || '');\n  const matchedRows = rowsByOrgIndex.get(idx) || [];\n  const matchedInns = matchedRows.map(getRowInn).filter(Boolean);\n  // Fallback: also check aggregated set (covers alwaysOutputData empty objects)\n  const exists = Boolean(inn) && (\n    matchedInns.includes(inn) ||\n    rows.some((r) => getRowInn(r) === inn)\n  );\n\n  return {\n    json: {\n      sender_email: p.sender_email || '',\n      subject: p.subject || '',\n      message_date: p.message_date || '',\n      message_id: p.message_id || '',\n      thread_id: p.thread_id || '',\n      body_full: p.body_full || '',\n      org_name: p.org_name || '',\n      org_address: p.org_address || '',\n      inn,\n      inn_exists: exists,\n      needs_manual_review: false,\n      rows_count: matchedRows.length,\n    },\n  };\n});\n"
+      },
+      "id": "fdc3f76b-467d-4da4-a865-76b044665b2d",
+      "name": "Code - Check INN Exists",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2576,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "410a3847-2c4c-4d9e-9d92-3d92055be889",
+              "leftValue": "={{ $json.inn_exists }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0c6b5ea3-0c5b-4e99-a598-7f7e6c867dc9",
+      "name": "IF - INN Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -2352,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.sender_email}}",
+        "subject": "={{'Re: ' + $json.subject}}",
+        "message": "=Добрый день! Проект с ИНН {{$json.inn}}{{$json.org_name ? ' (' + $json.org_name + ')' : ''}} уже принят в работу.",
+        "options": {}
+      },
+      "id": "82865a01-7837-4727-8bde-edbc94940b88",
+      "name": "Gmail Send - Duplicate INN",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -2112,
+        -224
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "SHEET_NAME_MAIN",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "created_at": "=={{$now.setZone('Europe/Moscow').toFormat('yyyy-LL-dd HH:mm:ss')}}",
+            "sender_email": "={{$json.sender_email}}",
+            "inn": "={{$json.inn}}",
+            "org_name": "={{$json.org_name}}",
+            "org_address": "={{$json.org_address}}",
+            "message_date": "={{$json.message_date}}",
+            "subject": "={{$json.subject}}",
+            "message_id": "={{$json.message_id}}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sender_email",
+              "displayName": "sender_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inn",
+              "displayName": "inn",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "org_name",
+              "displayName": "org_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "org_address",
+              "displayName": "org_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_date",
+              "displayName": "message_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "id": "cbd2f7ef-3ac2-4969-a8f3-44be7448eaa4",
+      "name": "Google Sheets - Append Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        -2112,
+        32
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GOOGLE_DRIVE_FILE_ID"
+        },
+        "options": {
+          "binaryPropertyName": "data"
+        }
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -1888,
+        32
+      ],
+      "id": "6c7779f4-b01b-46ed-8e16-9f0789446a35",
+      "name": "Download file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.sender_email}}",
+        "subject": "={{'Re: ' + $json.subject}}",
+        "message": "=Добрый день! Проект с ИНН {{$json.inn}}{{$json.org_name ? ' (' + $json.org_name + ')' : ''}} принят в работу. Прикрепляю коммерческое предложение.",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {}
+            ]
+          }
+        }
+      },
+      "id": "c33a1472-e870-4c89-8f74-8d1f852810e2",
+      "name": "Gmail Send - Success With Attachment",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -1664,
+        32
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -3696,
+        208
+      ],
+      "id": "a9a7ef15-f02f-4770-9701-7bbc6d689e96",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "name": "OpenAI account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Gmail Get Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Get Message": {
+      "main": [
+        [
+          {
+            "node": "Prepare Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Data": {
+      "main": [
+        [
+          {
+            "node": "AI Extract Organizations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Extract Organizations": {
+      "main": [
+        [
+          {
+            "node": "Validate Organizations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Needs Manual Review?": {
+      "main": [
+        [
+          {
+            "node": "Needs Manual Review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Split Organizations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets - Read All Rows": {
+      "main": [
+        [
+          {
+            "node": "Code - Check INN Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Check INN Exists": {
+      "main": [
+        [
+          {
+            "node": "IF - INN Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - INN Exists?": {
+      "main": [
+        [
+          {
+            "node": "Gmail Send - Duplicate INN",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Sheets - Append Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets - Append Row": {
+      "main": [
+        [
+          {
+            "node": "Download file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download file": {
+      "main": [
+        [
+          {
+            "node": "Gmail Send - Success With Attachment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Extract Organizations",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Organizations": {
+      "main": [
+        [
+          {
+            "node": "IF - Needs Manual Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Organizations": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets - Read All Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "00000000-0000-4000-8000-000000000000",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "YOUR_WORKFLOW_ID",
+  "tags": []
+}
